@@ -5,11 +5,16 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +23,67 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Authentication configuration
+SECRET_KEY = "your-secret-key-here"  # In production, use environment variable
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# Teacher credentials (in production, load from secure config)
+teachers = {
+    "teacher1": "pass1",
+    "teacher2": "pass2",
+}
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return email
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def authenticate_user(username: str, password: str):
+    if username in teachers and teachers[username] == password:
+        return {"role": "teacher", "username": username}
+    return False
+
+def validate_student_email(email: str):
+    if not email.endswith("@mergington.edu"):
+        return False
+    # In a real app, you might check against a student database
+    return True
+
+# Login endpoints
+@app.post("/login/student")
+def login_student(email: str = Form(...)):
+    if not validate_student_email(email):
+        raise HTTPException(status_code=400, detail="Invalid student email")
+    access_token = create_access_token(data={"sub": email, "role": "student"})
+    return {"access_token": access_token, "token_type": "bearer", "role": "student"}
+
+@app.post("/login/teacher")
+def login_teacher(username: str = Form(...), password: str = Form(...)):
+    user = authenticate_user(username, password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    access_token = create_access_token(data={"sub": username, "role": "teacher"})
+    return {"access_token": access_token, "token_type": "bearer", "role": "teacher"}
 
 # In-memory activity database
 activities = {
@@ -89,7 +155,7 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, current_user: str = Depends(verify_token)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -105,13 +171,20 @@ def signup_for_activity(activity_name: str, email: str):
             detail="Student is already signed up"
         )
 
+    # Check capacity
+    if len(activity["participants"]) >= activity["max_participants"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Activity is full"
+        )
+
     # Add student
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, current_user: str = Depends(verify_token)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
